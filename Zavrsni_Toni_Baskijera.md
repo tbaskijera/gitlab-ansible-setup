@@ -65,7 +65,7 @@ Image resized.
 
 Tada možemo pokrenuti [Virtual Machine Manager](https://virt-manager.org/) te započnemo s procesom stvaranja nove virtualne mašine. Redom biramo *Import existing disk image ->, Browse local image* gdje izaberemo našu datoteku u `qcow2` formatu.  Na dnu prozora izaberemo ArchLinux kao sustav kojeg instaliramo na novu mašinu. Sljedeći prozor možemo preskočiti, a na zadnjem možemo označiti kvadratić *Customize configuration before install*.
 
-Zatim biramo *Add hardware* te dodamo uređaj za pohranu tipa cd-rom s prilagođenom slikom koju smo malo prije stvorili, `cloud init.iso`. Zatim započnemo instalaciju.
+Zatim biramo *Add hardware* te dodamo uređaj za pohranu tipa cd-rom s prilagođenom slikom koju smo malo prije stvorili, `cloud init.iso`. Zatim započnemo instalaciju. Pod *Memory*, virtualnoj mašini dodjeliti ćemo više memorije, 6024 MiB, kako bi se kasnije GitLab mogao pokretati bez poteškoća.
 
 S završetkom instalacije logiramo se u operacijski sustav, te provjerimo koja nam je ip adresa naredbom `ip addr` kako bismo se onda mogli "sshati" u nju naredbom:
 
@@ -582,6 +582,13 @@ Created symlink /etc/systemd/system/multi-user.target.wants/zfs.target → /usr/
 
 ```
 
+Podatke aplikacije koji se nalaze u `/var/lib/gitlab` premjestiti ćemo u `/Gitlab_data` te napraviti vezu:
+
+```bash
+[tonib@archlinux ~]$ sudo mv /var/lib/gitlab /Gitlab_data
+[tonib@archlinux Gitlab_data]$ sudo ln -s /Gitlab_data /var/lib/gitlab
+```
+
 ### Automatizacija periodičkog backupa
 
 Osigurati ćemo automatizirano periodičko (na dnevnoj bazi) stvaranje sigurnosne kopije podataka u bazenu Gitlab_data, koju ćemo zatim pohraniti u bazen Gitlab-backup.
@@ -763,6 +770,8 @@ Dodamo željena pravila:
 
 ```bash
 [tonib@archlinux ~]$ sudo nft add rule inet moja_tablica moj_lanac tcp dport {22, 80, 433} accept
+[tonib@archlinux ~]$ sudo nft add rule inet moja_tablica moj_lanac ct state established, related accept
+[tonib@archlinux ~]$ sudo nft add rule inet moja_tablica moj_lanac iif "lo" accept # potrebno jer se u suprotnome ne pokreće servis gitlab-puma
 ```
 
 I promjenimo pravilo lanca:
@@ -774,13 +783,16 @@ I promjenimo pravilo lanca:
 Krajnje stanje:
 
 ```bash
-[tonib@archlinux ~]$ sudo nft list table inet moja_tablica
+[tonib@archlinux ~]$ sudo nft list ruleset
 table inet moja_tablica {
   chain moj_lanac {
     type filter hook input priority filter; policy drop;
     tcp dport { 22, 80, 433 } accept
+    ct state established,related accept
+    iif "lo" accept 
   }
 }
+
 ```
 
 Trenutne tablice, lance i pravila spremiti ćemo u `/etc/nftables.conf`, odkud servis nftables čita pri svakom bootu (ukoliko je servis omogućen). Za oboje se možemo pobrinuti na sljedeći način:
@@ -789,10 +801,15 @@ Trenutne tablice, lance i pravila spremiti ćemo u `/etc/nftables.conf`, odkud s
 [tonib@archlinux ~]$ sudo systemctl enable nftables
 Created symlink /etc/systemd/system/multi-user.target.wants/nftables.service → /usr/lib/systemd/system/nftables.service.
 [tonib@archlinux etc]$ sudo systemctl enable nftables
-[tonib@archlinux etc]$ sudo nft list ruleset > /etc/nftables.conf
--bash: /etc/nftables.conf: Permission denied
-[tonib@archlinux etc]$ sudo -i
-[root@archlinux ~]\# nft list ruleset > /etc/nftables.conf
+[tonib@archlinux ~]$ sudo nft -s list ruleset | tee /etc/nftables.conf
+table inet moja_tablica {
+  chain moj_lanac {
+    type filter hook input priority filter; policy drop;
+    tcp dport { 22, 80, 433 } accept
+    ct state established,related accept
+    iif "lo" accept 
+  }
+}
 
 ```
 
@@ -846,7 +863,7 @@ Najprije ćemo osvježiti liste master paketa Arch Linuxa:
 Tada se možemo pobrinuti za sam Gitlab:
 
 ```yml
-ttasks:
+tasks:
     - name: Update lists
       ansible.builtin.pacman:
         update_cache: yes
@@ -1240,15 +1257,6 @@ Potrebno je i postaviti cache bazu Redis za postizanje dostojnih performansi, a 
         name: redis
         state: restarted
     
-    - name: Ensure Nginx is at the latest version
-      ansible.builtin.pacman:
-        name: nginx
-        state: latest
-
-    - name: Restart Nginx
-      service:
-        name: nginx
-        state: restarted
 ```
 
 Osigurali smo da je Redis instaliran. Iskoristili smo uslugu systemd kako bi se servis omogućio te osiguralo da nije maskiran. Stvorili smo `redis.conf` konfiguracijsku datoteku s određenim dozvolama u korijenskom direktoriju, ispunili je, a zatim njen sadržaj kopirali u zadanu redis konfiguraciju. Isto smo napravili i s datotekom `resque.yml`. Dodali smo korisnika gitlab u korisničku grupu redis.
@@ -1931,5 +1939,9 @@ Korištenjem naredbe `curl` možemo se uvjeriti da se GitLab uistinu poslužuje,
 
 ```bash
 [tonib@archlinux ~]$ curl localhost:80
-<html><body>You are being <a href="http://localhost/users/sign_in">redirected</a>.</body></html>[tonib@archlinux ~]$ 
+<html><body>You are being <a href="http://localhost/users/sign_in">redirected</a>.</body></html> 
 ```
+
+U pregledniku na lokalnoj mašini možemo posjetiti GitLab unosom adrese: `http://192.168.122.72`
+
+> ***Upozorenje:*** Ukoliko GitLab prilikom stvaranja nove, incijalne lozinke javlja grešku "*422 The change you requested was rejected. Make sure you have access to the thing you tried to change. Please contact your GitLab administrator if you think this is a mistake.*", vrlo je lako moguće da su postavke datuma i/ili vremena krive, te ih je potrebno namjestiti.
