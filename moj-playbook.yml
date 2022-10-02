@@ -1,0 +1,265 @@
+---
+- name: Setup Gitlab infrastructure
+  hosts: all
+  become: yes
+  vars:
+    ime_baze: gitlabhq_production
+    user: gitlab
+    user_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          31353033343035336531643163323231363763393432346565353263653836396462333962636538
+          6563333762346232346538653531626532636435643665370a626666656563666437653834636164
+          62336134636235336363643861303633653834383261346264313036313830306537653666313863
+          6165306638633039330a643536633464393837393361643938343932396438383861386630313461
+          3033
+    secret1: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          65613061376439643661383732633236643534363431363233343733623331303565353965346138
+          3337386462343735393531623838656466613338313634360a393930333565326166383532333539
+          63643433316139323666643763326562353230633665393665646239303531326530393239383933
+          3532663939666330650a333230303439386234663236643962636637363261393164376663373463
+          33623737313234393535653431336664666638396166396135373936336532656430306564366665
+          64353536333935656639356263363565343037333436373365316662313862663833616235666162
+          61316632626664383033653432636164316436326363613865613139303538303764666261666665
+          62356139333432613262376263366466646135333535633665633162346238363266356162646161
+          35663134383039616231396137633734333030353433343464363763653139613135336364323636
+          66373134383264353734356562343534363266313732313838323138366361323364303561363665
+          323361343431356437313033353362333830
+
+
+
+  tasks:
+    - name: Update lists
+      ansible.builtin.pacman:
+        update_cache: yes
+
+    #GITLAB
+    - name: Ensure gitlab is present
+      ansible.builtin.pacman:
+        name: gitlab
+        state: present
+
+    - name: Write secrets
+      shell: |
+        hexdump -v -n 64 -e '1/1 "%02x"' /dev/urandom > /etc/webapps/gitlab/secret
+        chmod 640 /etc/webapps/gitlab/secret
+        hexdump -v -n 64 -e '1/1 "%02x"' /dev/urandom > /etc/webapps/gitlab-shell/secret
+        chmod 640 /etc/webapps/gitlab-shell/secret
+
+    - name: Template file secrets.yml
+      ansible.builtin.template:
+        src: ./secrets.yml.j2
+        dest: /etc/webapps/gitlab/secrets.yml
+
+    #POSTGRES
+    - name: Ensure postgres is present
+      ansible.builtin.pacman:
+        name: postgresql
+        state: present
+
+    - name: Ensure psycopg2 is present
+      ansible.builtin.pacman:
+        name: python-psycopg2
+        state: present
+
+    - name: Create a directory if it does not exist
+      ansible.builtin.file:
+        path: /var/lib/postgres/data
+        state: directory
+        mode: "0755"
+        owner: postgres
+        group: postgres
+    
+
+    - name: Configure postgres
+      become_user: postgres
+      ansible.builtin.command:
+        cmd: initdb -D /var/lib/postgres/data
+
+    - name: Ensure that postgres is started
+      ansible.builtin.service:
+        name: postgresql
+        enabled: yes
+        state: started
+
+    - name: Create a new database
+      community.postgresql.postgresql_db:
+        name: "{{ime_baze}}"
+
+    - name: Create database user
+      community.postgresql.postgresql_user:
+        db: "{{ime_baze}}"
+        name: "{{user}}"
+        password: "{{user_password}}"
+        role_attr_flags: SUPERUSER
+
+    - name: Template file database.yml
+      ansible.builtin.template:
+        src: ./database.yml.j2
+        dest: "/etc/webapps/gitlab/database.yml"
+
+    #REDIS
+    - name: Ensure Redis is present
+      ansible.builtin.pacman:
+        name: redis
+        state: present
+
+    - name: Enable service redis and ensure it is not masked
+      ansible.builtin.systemd:
+        name: redis
+        enabled: yes
+        masked: no
+
+      #redis.conf
+    - name: Touch a file, using symbolic modes to set the permissions (equivalent to 0644)
+      ansible.builtin.file:
+        path: ./redis.conf
+        state: touch
+        mode: u=rw,g=r,o=r
+
+    - name: Add custom configuration at ./redis.conf
+      ansible.builtin.blockinfile:
+        path: ./redis.conf
+        block: |
+          port 6379
+          unixsocket /run/redis/redis.sock
+          unixsocketperm 770
+
+    - name: Copy redis.conf
+      ansible.builtin.copy:
+        src: ./redis.conf
+        dest: /etc/redis/redis.conf
+
+      #resque.yml
+    - name: Touch a file, using symbolic modes to set the permissions (equivalent to 0644)
+      ansible.builtin.file:
+        path: ./resque.yml
+        state: touch
+        mode: u=rw,g=r,o=r
+
+    - name: Add custom configuration at ./resque.yml
+      ansible.builtin.blockinfile:
+        path: ./resque.yml
+        block: |
+          development:
+            url: unix:/run/redis/redis.sock
+          test:
+            url: unix:/run/redis/redis.sock
+          production:
+            url: unix:/run/redis/redis.sock
+
+    - name: Copy resque.yml
+      ansible.builtin.copy:
+        src: ./resque.yml
+        dest: /etc/webapps/gitlab/resque.yml
+
+    - name: Add the user 'gitlab' to group 'redis'
+      ansible.builtin.user:
+        name: gitlab
+        group: redis
+
+    - name: Restart service redis
+      ansible.builtin.service:
+        name: redis
+        state: restarted
+    
+    #GITLAB
+    - name: Configure permissions for smtp_setting.rb
+      ansible.builtin.command:
+        chdir: /etc/webapps/gitlab
+        cmd: sudo chown gitlab smtp_settings.rb
+    
+    - name: Ensure python-pip is present
+      ansible.builtin.pacman:
+        name: python-pip
+        state: present
+    
+    - name: Ensure py module pexpect is present
+      ansible.builtin.pip:
+        name: pexpect
+        state: present
+    
+    - name: Setup Gitlab
+      ansible.builtin.expect:
+        echo: yes
+        chdir: /usr/share/webapps/gitlab
+        command: /bin/bash -c "sudo -u gitlab $(cat environment | xargs) bundle-2.7 exec rake gitlab:setup"
+        timeout: 500
+        responses:
+          'to continue': 'yes'
+    
+    #NGINX
+    - name: Ensure Nginx is present
+      ansible.builtin.pacman:
+        name: nginx
+        state: present
+    
+    - name: Copy nginx.conf
+      ansible.builtin.copy:
+        src: ./nginx.conf
+        dest: /etc/nginx/nginx.conf
+    
+    - name: Create directory
+      ansible.builtin.file:
+        path: /etc/nginx/sites-available
+        state: directory
+    
+    - name: Create directory
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled
+        state: directory
+    
+    - name: Copy gitlab
+      ansible.builtin.copy:
+        src: ./gitlab
+        dest: /etc/nginx/sites-available/gitlab
+    
+    - name: Create symbolic link 
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/gitlab
+        dest: /etc/nginx/sites-enabled/gitlab
+        state: link
+      
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
+    
+    #RESTARTS
+    - name: Restart postgres
+      ansible.builtin.systemd:
+        name: postgresql
+        enabled: yes
+        state: restarted
+      
+    - name: Restart redis
+      ansible.builtin.systemd:
+        name: redis
+        enabled: yes
+        state: restarted
+
+    - name: Restart gitlab.target
+      ansible.builtin.systemd:
+        name: gitlab.target
+        enabled: yes
+        state: restarted
+    
+    - name: Restart gitlab.gitaly
+      ansible.builtin.systemd:
+        name: gitlab-gitaly
+        enabled: yes
+        state: restarted
+    
+    - name: Restart gitlab-puma
+      ansible.builtin.systemd:
+        name: gitlab-puma
+        enabled: yes
+        state: restarted
+    
+    - name: Restart gitlab-workhorse
+      ansible.builtin.systemd:
+        name: gitlab-workhorse
+        enabled: yes
+        state: restarted
+    
